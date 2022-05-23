@@ -37,7 +37,7 @@ import (
 	"github.com/alecthomas/units"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	conntrack "github.com/mwitkow/go-conntrack"
+	"github.com/mwitkow/go-conntrack"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -51,8 +51,8 @@ import (
 	jcfg "github.com/uber/jaeger-client-go/config"
 	jprom "github.com/uber/jaeger-lib/metrics/prometheus"
 	"go.uber.org/atomic"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
-	klog "k8s.io/klog"
+	"gopkg.in/alecthomas/kingpin.v2"
+	"k8s.io/klog"
 	klogv2 "k8s.io/klog/v2"
 
 	"github.com/prometheus/prometheus/config"
@@ -372,9 +372,12 @@ func main() {
 	level.Info(logger).Log("vm_limits", prom_runtime.VMLimits())
 
 	var (
-		localStorage  = &readyStorage{}
-		scraper       = &readyScrapeManager{}
+		// 用于指标的本地存储
+		localStorage = &readyStorage{}
+		scraper      = &readyScrapeManager{}
+		// 用于指标的远程存储
 		remoteStorage = remote.NewStorage(log.With(logger, "component", "remote"), prometheus.DefaultRegisterer, localStorage.StartTime, cfg.localStoragePath, time.Duration(cfg.RemoteFlushDeadline), scraper)
+		// 为localStorage与remoteStorage的读写代理器，且remoteStorage可以有多个传入
 		fanoutStorage = storage.NewFanout(logger, localStorage, remoteStorage)
 	)
 
@@ -382,14 +385,18 @@ func main() {
 		ctxWeb, cancelWeb = context.WithCancel(context.Background())
 		ctxRule           = context.Background()
 
+		// notifier 组件的构建通过调用 notifier.New 方法完成，cfg.notifier为notifier组件的配置信息，调用log.With方法返回的logger用于记录系统日志
 		notifierManager = notifier.NewManager(&cfg.notifier, log.With(logger, "component", "notifier"))
 
 		ctxScrape, cancelScrape = context.WithCancel(context.Background())
-		discoveryManagerScrape  = discovery.NewManager(ctxScrape, log.With(logger, "component", "discovery manager scrape"), discovery.Name("scrape"))
+		// discoveryManagerScrape 组件的构建通过调用discovery.NewManager方法完成，参数logger用于记录系统日志
+		discoveryManagerScrape = discovery.NewManager(ctxScrape, log.With(logger, "component", "discovery manager scrape"), discovery.Name("scrape"))
 
 		ctxNotify, cancelNotify = context.WithCancel(context.Background())
-		discoveryManagerNotify  = discovery.NewManager(ctxNotify, log.With(logger, "component", "discovery manager notify"), discovery.Name("notify"))
+		// discoveryManagerNotify 组件用于发现告警通知服务，与prometheus.yml配置文件中的alerting标签相关联
+		discoveryManagerNotify = discovery.NewManager(ctxNotify, log.With(logger, "component", "discovery manager notify"), discovery.Name("notify"))
 
+		//scrapeManager 组件的构建调用 scrape.NewScrapeManager方法完成，参数logger用于记录系统日志
 		scrapeManager = scrape.NewManager(log.With(logger, "component", "scrape manager"), fanoutStorage)
 
 		opts = promql.EngineOpts{
@@ -402,17 +409,19 @@ func main() {
 			NoStepSubqueryIntervalFn: noStepSubqueryInterval.Get,
 		}
 
+		// queryEngine 组件的构建调用 promql.NewEngine 方法完成
 		queryEngine = promql.NewEngine(opts)
 
+		// ruleManager组件的构建调用rules.NewManager方法完成
 		ruleManager = rules.NewManager(&rules.ManagerOptions{
-			Appendable:      fanoutStorage,
-			Queryable:       localStorage,
-			QueryFunc:       rules.EngineQueryFunc(queryEngine, fanoutStorage),
+			Appendable:      fanoutStorage,                                     // 存储器
+			Queryable:       localStorage,                                      // 规则计算
+			QueryFunc:       rules.EngineQueryFunc(queryEngine, fanoutStorage), //告警通知
 			NotifyFunc:      sendAlerts(notifierManager, cfg.web.ExternalURL.String()),
-			Context:         ctxRule,
-			ExternalURL:     cfg.web.ExternalURL,
-			Registerer:      prometheus.DefaultRegisterer,
-			Logger:          log.With(logger, "component", "rule manager"),
+			Context:         ctxRule,                                       // 控制ruleManager组件中的goroutine
+			ExternalURL:     cfg.web.ExternalURL,                           // web访问地址
+			Registerer:      prometheus.DefaultRegisterer,                  // 系统指标注册器
+			Logger:          log.With(logger, "component", "rule manager"), //系统日志记录
 			OutageTolerance: time.Duration(cfg.outageTolerance),
 			ForGracePeriod:  time.Duration(cfg.forGracePeriod),
 			ResendDelay:     time.Duration(cfg.resendDelay),
@@ -433,6 +442,7 @@ func main() {
 	cfg.web.Notifier = notifierManager
 	cfg.web.LookbackDelta = time.Duration(cfg.lookbackDelta)
 
+	// 用于记录Prometheus的版本信息
 	cfg.web.Version = &web.PrometheusVersion{
 		Version:   version.Version,
 		Revision:  version.Revision,
@@ -442,6 +452,7 @@ func main() {
 		GoVersion: version.GoVersion,
 	}
 
+	// 用于记录命令行配置信息
 	cfg.web.Flags = map[string]string{}
 
 	// Exclude kingpin default flags to expose only Prometheus ones.
@@ -455,6 +466,7 @@ func main() {
 	}
 
 	// Depends on cfg.web.ScrapeManager so needs to be after cfg.web.ScrapeManager = scrapeManager.
+	// 通过调用web.New方法构建了Web组件，logger参数用于记录系统日志，在cfg.web中记录了Prometheus的版本、配置及编译信息等。
 	webHandler := web.New(log.With(logger, "component", "web"), &cfg.web)
 
 	// Monitor outgoing connections on default transport with conntrack.
@@ -491,6 +503,7 @@ func main() {
 			reloader: scrapeManager.ApplyConfig,
 		}, {
 			name: "scrape_sd",
+			// discoveryManagerScrape 配置加载
 			reloader: func(cfg *config.Config) error {
 				c := make(map[string]discovery.Configs)
 				for _, v := range cfg.ScrapeConfigs {
@@ -503,6 +516,7 @@ func main() {
 			reloader: notifierManager.ApplyConfig,
 		}, {
 			name: "notify_sd",
+			// discoveryManagerNotify 配置加载
 			reloader: func(cfg *config.Config) error {
 				c := make(map[string]discovery.Configs)
 				for k, v := range cfg.AlertingConfig.AlertmanagerConfigs.ToMap() {
@@ -515,6 +529,7 @@ func main() {
 			reloader: func(cfg *config.Config) error {
 				// Get all rule files matching the configuration paths.
 				var files []string
+				// 遍历规则文件
 				for _, pat := range cfg.RuleFiles {
 					fs, err := filepath.Glob(pat)
 					if err != nil {
@@ -601,6 +616,7 @@ func main() {
 	}
 	{
 		// Scrape discovery manager.
+		// discoveryManagerScrape 组件的启动过程
 		g.Add(
 			func() error {
 				err := discoveryManagerScrape.Run()
@@ -694,7 +710,7 @@ func main() {
 			func() error {
 				select {
 				case <-dbOpen:
-				// In case a shutdown is initiated before the dbOpen is released
+					// In case a shutdown is initiated before the dbOpen is released
 				case <-cancel:
 					reloadReady.Close()
 					return nil
@@ -820,6 +836,8 @@ func main() {
 			},
 		)
 	}
+	// 在完成各组件服务启动方法的添加后，调用Run()方法运行
+	// execute方法在Run方法中先被执行，当execute 方法在执行过程中出现错误或者退出时，interrupt 方法将被触发执行，且加入 actors 中的所有 interrupt 方法都将被触发。
 	if err := g.Run(); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)

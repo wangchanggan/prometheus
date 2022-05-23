@@ -29,3 +29,101 @@ https://github.com/prometheus/prometheus/archive/refs/tags/v2.24.0.zip
 | util/ | 工具类 | |
 | vendor/| 第三方依赖包 | |
 | web/| prometheus Web服务模块 | |
+
+## Prometheus的初始化
+### 初始化服务组件
+#### 存储组件
+Prometheus 对指标的存储采用的是时序数据库，localStorage 与 remoteStorage 在初始化时需要使用相同的时间基线（localStorage.StartTime）存储指标。
+
+指标的存储周期默认为15d，可通过 Prometheus 命令行参数--storage.tsdb.retention=15d进行个性化设置。
+
+cmd/prometheus/main.go:375
+
+#### notifier组件
+notifier组件用于告警通知，在完成初始化后，notifier组件内部会构建一个告警通知队列，队列的大小由命令行参数 --alertmanager.notification-queue-capacity确定，默认值为10000，且告警信息通过sendAlerts方法发送给AlertManager。
+
+cmd/prometheus/main.go:389
+
+#### discoveryManagerScrape组件
+discoveryManagerScrape 组件用于发现指标采集服务，对应prometheus.yml配置文件中scrape_configs节点下的各种指标采集器（static_config、kubernetes_sd_config、openstack_sd_config、consul_sd_config 等）
+
+cmd/prometheus/main.go:393
+
+#### discoveryManagerNotify组件
+discoveryManagerNotify组件的构建与 discoveryManagerScrape 组件的构建方式一样，不同的是前者服务于 notify，后者服务于scrape
+
+cmd/prometheus/main.go:397
+
+#### scrapeManager组件
+scrapeManager组件用于管理对指标的采集，并将所采集的指标存储到fanoutStorage中。
+
+scrapeManager组件的采集周期在prometheus.yml配置文件中由 global节点下的 scrape_interval 指 定，且各个job_name可以在scrape_configs下进行个性化设置，设置符合自身应用场景的scrape_interval。
+
+prometheus.yml 配置文件中global下的scrape_interval作用域为全局，所有job_name共用。在scrape_configs下job_name中所配置的 scrape_interval作用域仅限所描述的job_name。
+
+cmd/prometheus/main.go:400
+
+#### queryEngine组件
+queryEngine 组件为规则查询计算引擎，在初始化时会对查询超时时间（cfg.query Timeout）和并发查询个数（cfg.queryEngine.MaxConcurrentQueries）进行设置。
+
+cmd/prometheus/main.go:413
+
+#### ruleManager组件
+ruleManager组件整合了 fanoutStorage组件、queryEngine组件和 notifier组件，完成了从规则运算到告警发送的流程。
+
+规则运算周期在 prometheus.yml 配置文件中由 global 节点下的 evaluation_interval 指定，各个job_name还可以在scrape_configs下进行个性化设置，设置符合自身应用场景的规则运算周期（evaluation_interval）。
+
+在 global 下配置的 evaluation_interval 作用域为全局，在scrape_configs下job_name所配置的scrape_interval作用域仅限所描述的job_name。
+
+cmd/prometheus/main.go:416
+
+### web组件
+在 Web 服务中引用了 localStorage 组件、fanoutStorage组件、scrapeManager组件、ruleManager组件和notifier组件，并对外提供了HTTP访问服务。
+
+cmd/prometheus/main.go:446
+
+
+### 组件配置管理
+组件配置管理就是将相关组件的配置加载过程统一为ApplyConfig 方法，并存储到reloaders中进行统一调用。
+
+在remoteStorage、webHandler、notifier和scrapeManager组件中对ApplyConfig方法有直接的实现。
+
+discovery/manager.go:156
+
+cmd/prometheus/main.go:507,520
+
+rules/manager.go:940
+
+cmd/prometheus/main.go:529
+
+
+### 启动服务组件
+vendor/github.com/oklog/run/group.go:24
+
+cmd/prometheus/main.go:620,841
+
+vendor/github.com/oklog/run/group.go:32
+
+Prometheus各服务组件的启动流程由10次group的Add方法调用链构成，具体内容如下：
+
+◎ 第1个Add用于控制 Prometheus程序的退出。当满足以下任一条件时将退出：Prometheus接收到 SIGTERM系统信号；Prometheus程序设置了--web.enable-lifecycle参数来启动且收到curl -X POST localhost:9090/-/quit请求。
+
+◎ 第2个Add用于启动discoveryManagerScrape服务。
+
+◎ 第3个Add用于启动discoveryManagerNotify服务。
+
+◎ 第4个Add根据在第2个 Add中 discoveryManagerScrape发现的 scrape服务启动且采集指标数据。
+
+◎ 第5个Add用于系统配置的热加载，reloadConfig方法用于加载系统配置文件，且当 Prometheus 进程收到 SIGHUP 信号或者收到curl -X POST localhost:9090/-/reload请求（Prometheus启动参数--web.enable-lifecycle）时，reloadConfig方法会被调用。
+
+◎ 第6个Add用于初始化系统配置的参数和设置Web可用的服务状态。
+
+◎ 第7个Add用于启动规则管理组件ruleManager。
+
+◎ 第8个Add启动存储组件，Prometheus 指标的存储采用的是时序数据库，所以在初始化启动时会设置开始时间和储存路径。
+
+◎ 第9个Add用于启动Web服务组件。
+
+◎ 第10个Add根据在第3个Add中discoveryManagerNotify发现的AlertManager启动notifier组件服务。
+
+![image](docs/images/component_relationship.png)
