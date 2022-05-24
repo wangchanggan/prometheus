@@ -31,6 +31,7 @@ import (
 // It does guarantee that it sends the new TargetGroup whenever a change happens.
 //
 // Discoverers should initially send a full set of all discoverable TargetGroups.
+// 为了对scrape发现服务进行统一管理，Prometheus对所支持的发现服务都抽象出Discoverer接口，各scrape发现服务都必须实现该接口并用于服务发现
 type Discoverer interface {
 	// Run hands a channel to the discovery provider (Consul, DNS, etc.) through which
 	// it can send updated target groups. It must return when the context is canceled.

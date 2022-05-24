@@ -113,20 +113,21 @@ func Name(n string) func(*Manager) {
 
 // Manager maintains a set of discovery providers and sends each update to a map channel.
 // Targets are grouped by the target set name.
+// 服务发现管理者（Manager）是所有发现服务的入口，在服务上线、下线和更新时都需要进行服务同步。
 type Manager struct {
-	logger         log.Logger
+	logger         log.Logger // 系统日志记录
 	name           string
-	mtx            sync.RWMutex
-	ctx            context.Context
-	discoverCancel []context.CancelFunc
+	mtx            sync.RWMutex         // 同步读写锁
+	ctx            context.Context      // 协同控制
+	discoverCancel []context.CancelFunc // 服务下线调用
 
 	// Some Discoverers(eg. k8s) send only the updates for a given target group
 	// so we use map[tg.Source]*targetgroup.Group to know which group to update.
-	targets map[poolKey]map[string]*targetgroup.Group
+	targets map[poolKey]map[string]*targetgroup.Group // 发现的目标服务
 	// providers keeps track of SD providers.
 	providers []*provider
 	// The sync channel sends the updates as a map where the key is the job value from the scrape config.
-	syncCh chan map[string][]*targetgroup.Group
+	syncCh chan map[string][]*targetgroup.Group // 将所发现的目标服务以chan的方式通知接收方
 
 	// How long to wait before sending updates to the channel. The variable
 	// should only be modified in unit tests.
@@ -153,6 +154,7 @@ func (m *Manager) SyncCh() <-chan map[string][]*targetgroup.Group {
 
 // ApplyConfig removes all running discovery providers and starts new ones using the provided config.
 // discoveryManagerScrape 组件和 discoveryManagerNotify 组件都属于discovery模块中的Manager 结构
+// 加载服务发现配置
 func (m *Manager) ApplyConfig(cfg map[string]Configs) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
@@ -162,19 +164,23 @@ func (m *Manager) ApplyConfig(cfg map[string]Configs) error {
 			discoveredTargets.DeleteLabelValues(m.name, pk.setName)
 		}
 	}
+	// 取消所有Discoverer
 	m.cancelDiscoverers()
 	m.targets = make(map[poolKey]map[string]*targetgroup.Group)
 	m.providers = nil
 	m.discoverCancel = nil
 
 	failedCount := 0
+	// 遍历Discoverer配置
 	for name, scfg := range cfg {
+		// 根据scfg配置构建Discoverer实例，
 		failedCount += m.registerProviders(scfg, name)
 		discoveredTargets.WithLabelValues(m.name, name).Set(0)
 	}
 	failedConfigs.WithLabelValues(m.name).Set(float64(failedCount))
 
 	for _, prov := range m.providers {
+		// 启动服务
 		m.startProvider(m.ctx, prov)
 	}
 
@@ -195,11 +201,15 @@ func (m *Manager) StartCustomProvider(ctx context.Context, name string, worker D
 func (m *Manager) startProvider(ctx context.Context, p *provider) {
 	level.Debug(m.logger).Log("msg", "Starting provider", "provider", p.name, "subs", fmt.Sprintf("%v", p.subs))
 	ctx, cancel := context.WithCancel(ctx)
+	// 存储刷新的服务
 	updates := make(chan []*targetgroup.Group)
 
+	// 添加取消discover的方法
 	m.discoverCancel = append(m.discoverCancel, cancel)
 
+	// 启动具体的服务发现
 	go p.d.Run(ctx, updates)
+	// 同步更新所发现的服务
 	go m.updater(ctx, p, updates)
 }
 
@@ -208,7 +218,7 @@ func (m *Manager) updater(ctx context.Context, p *provider, updates chan []*targ
 		select {
 		case <-ctx.Done():
 			return
-		case tgs, ok := <-updates:
+		case tgs, ok := <-updates: // 更新目标服务信号
 			receivedUpdates.WithLabelValues(m.name).Inc()
 			if !ok {
 				level.Debug(m.logger).Log("msg", "Discoverer channel closed", "provider", p.name)
@@ -266,8 +276,10 @@ func (m *Manager) updateGroup(poolKey poolKey, tgs []*targetgroup.Group) {
 	defer m.mtx.Unlock()
 
 	if _, ok := m.targets[poolKey]; !ok {
+		// 如果所发现的新服务不在targets中，就申请新的存储单元
 		m.targets[poolKey] = make(map[string]*targetgroup.Group)
 	}
+	// 更新targets列表
 	for _, tg := range tgs {
 		if tg != nil { // Some Discoverers send nil target group so need to check for it to avoid panics.
 			m.targets[poolKey][tg.Source] = tg
@@ -279,12 +291,14 @@ func (m *Manager) allGroups() map[string][]*targetgroup.Group {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
+	// 快照存储
 	tSets := map[string][]*targetgroup.Group{}
 	for pkey, tsets := range m.targets {
 		var n int
 		for _, tg := range tsets {
 			// Even if the target group 'tg' is empty we still need to send it to the 'Scrape manager'
 			// to signal that it needs to stop all scrape loops for this target set.
+			// 通过append添加目标服务是对目标服务的复制
 			tSets[pkey.setName] = append(tSets[pkey.setName], tg)
 			n += len(tg.Targets)
 		}

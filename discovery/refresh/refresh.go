@@ -73,6 +73,7 @@ func NewDiscovery(l log.Logger, mech string, interval time.Duration, refreshf fu
 // Run implements the Discoverer interface.
 func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	// Get an initial set right away.
+	// 初次调用服务更新处理
 	tgs, err := d.refresh(ctx)
 	if err != nil {
 		if ctx.Err() != context.Canceled {
@@ -86,12 +87,15 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		}
 	}
 
+	// 构建定时器
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			// 定时查看服务是否有变化
+			// 当服务发生变化时，将通过ch通知给服务发现的管理者
 			tgs, err := d.refresh(ctx)
 			if err != nil {
 				if ctx.Err() != context.Canceled {

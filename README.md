@@ -88,7 +88,7 @@ cmd/prometheus/main.go:446
 
 在remoteStorage、webHandler、notifier和scrapeManager组件中对ApplyConfig方法有直接的实现。
 
-discovery/manager.go:156
+discovery/manager.go:158
 
 cmd/prometheus/main.go:507,520
 
@@ -127,3 +127,19 @@ Prometheus各服务组件的启动流程由10次group的Add方法调用链构成
 ◎ 第10个Add根据在第3个Add中discoveryManagerNotify发现的AlertManager启动notifier组件服务。
 
 ![image](docs/images/component_relationship.png)
+
+
+
+## 数据采集
+### 服务发现
+![image](docs/images/service_discovery_process.png)
+
+discovery/discovery.go:35
+
+discovery/targetgroup/targetgroup.go:25
+
+discovery/manager.go:117,311,201
+
+discovery/refresh/refresh.go:74
+
+discovery/manager.go:216,274,240,292
