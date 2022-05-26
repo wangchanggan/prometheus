@@ -143,3 +143,57 @@ discovery/manager.go:117,311,201
 discovery/refresh/refresh.go:74
 
 discovery/manager.go:216,274,240,292
+
+
+### 指标采集
+指标采集是指从发现的服务中定时获取指标数据。Prometheus 在启动过程中会完成对ScrapeManager的初始化，初始化过程包括构造ScrapeManager实例、加载配置和启动 ScrapeManager实例这三个步骤。ScrapeManager负责维护 scrapePool，并且管理scrape组件的生命周期。
+
+scrape/manager.go:123,104
+
+ScrapeManager 的配置加载，是根据 prometheus.yml 中的scrape_configs (ScrapeConfig)配置项，对scrape服务进行配置更新处理，调用方法为 ApplyConfig，其内部实现分初次加载和配置更新动态加载这两种场景。
+
+config/config.go:319
+
+scrape/manager.go:243
+
+sp.reload方法将重新配置scrapePool，其流程分为以下三步：
+
+◎ 构建新的scrapeLoop服务；
+
+◎ 停止线上所对应的scrapeLoop服务；
+
+◎ 启动新的scrapeLoop服务。
+
+scrape/scrape.go:332
+
+scrapeLoop对 scrape进行了一层封装，在控制指标采集的同时，会将采集到的数据存储到存储管理器中。
+
+![image](docs/images/scrape_config_load.png)
+
+ScrapeManager通过调用retrieval下的Manager.Run方法完成启动，其参数为根据 prometheus.yml 配置发现的目标服务（targetgroup.Group），由discovery模块中的Manager.SyncCh方法负责与ScrapeManager通信（服务上线、下线）。
+
+当syncCh发生变化时，将触发ScrapeManager中的reload方法，在reload 方法中会遍历目标服务（targetgroup.Group），根据tsetName （对应 prometheus.yml 配置文件中的jobName）从scrapePools中查找scrapePool，如果找不到，则新建一个scrapePool，使每个job都有一个对应的scrapePool。
+
+最后调用 sp.Sync(tgroup)来更新 scrapePool的信息，通过sync方法可以得出哪些target仍然是活跃的，哪些target已经失效了。
+
+scrape/manager.go:139,158,177
+
+sp.Sync 方法主要用于将 tgroup（targetgroup.Group 类型）转换为 Target，再调用scrapePool .sync方法同步scrape服务。
+
+ScrapePool主要管理目标服务和scrapeLoop。
+
+scrape/scrape.go::418
+
+scrapePool.sync方法将输入参数targets与原有的targets列表（sp.targets）进行对比，如果有新的 target 加入，就创建新的targetScraper 和 scrapeLoop，并且启动新的 scrapeLoop；如果发现已经失效的 target，就会停止 scrapeLoop 服务并删除对应的target和scrapeLoop。
+
+scrape/scrape.go:457
+
+scrapeLoop是scrape的直接管理者，每个scrapeLoop都通过一个goroutine来运行，scrapeLoop控制scrape进行指标的拉取。
+
+scrape/scrape.go:1018,1088
+
+◎ 在 scrapeAndReport 方法中调用 sl.scraper.scrape 进行指标采集，并将采集到的指标通过sl.append方法进行存储；
+
+◎ 在 scrape 过程中为了提高性能，使用 sync.Pool 机制来复用对象，在每次scrape后都会向Pool申请和scrape结果同样大小的byte slice，并将其添加到sl.buffers中，以供下一次获取的指标使用。
+
+![image](docs/images/scrape.png)
