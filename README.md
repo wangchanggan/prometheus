@@ -3,11 +3,25 @@
 Source Code From
 https://github.com/prometheus/prometheus/archive/refs/tags/v2.24.0.zip
 
-## 目录
-
 -   [Prometheus源码分析](#prometheus源码分析)
     -   [目录](#目录)
     -   [源码目录结构说明](#源码目录结构说明)
+    -   [Prometheus的初始化](#prometheus的初始化)
+        -   [初始化服务组件](#初始化服务组件)
+            -   [存储组件](#存储组件)
+            -   [notifier组件](#notifier组件)
+            -   [discoveryManagerScrape组件](#discoverymanagerscrape组件)
+            -   [discoveryManagerNotify组件](#discoverymanagernotify组件)
+            -   [scrapeManager组件](#scrapemanager组件)
+            -   [queryEngine组件](#queryengine组件)
+            -   [ruleManager组件](#rulemanager组件)
+        -   [web组件](#web组件)
+        -   [组件配置管理](#组件配置管理)
+        -   [启动服务组件](#启动服务组件)
+    -   [数据采集](#数据采集)
+        -   [服务发现](#服务发现)
+        -   [指标采集](#指标采集)
+        -   [存储指标](#存储指标)
     
 ## 源码目录结构说明
 | 源码目录 | 说明 | 备注 |
@@ -197,3 +211,30 @@ scrape/scrape.go:1018,1088
 ◎ 在 scrape 过程中为了提高性能，使用 sync.Pool 机制来复用对象，在每次scrape后都会向Pool申请和scrape结果同样大小的byte slice，并将其添加到sl.buffers中，以供下一次获取的指标使用。
 
 ![image](docs/images/scrape.png)
+
+
+### 存储指标
+Prometheus在通过scrape获取指标后，调用scrapeLoop.append方法将指标存储到fanoutStorage 组件中，但在scrape与fanoutStorage之间加了一层 scrapeCache，用于指标合法性校验。
+
+在scrapeCache中缓存了两种不合法的指标：
+
+◎ 指标纬度为空，这部分指标被称为无效指标。
+
+◎ 在连续两次指标存储中，第1次存储的不带时间戳指标在第2次存储的不带时间戳指标中不存在，这部分指标被称为过期指标。
+
+scrape/scrape.go:739,777,789,847,859,867,873,882,887
+
+在 scrapeLoop.append 方法中，先获取指标存储器（app）和指解析器（p），从p中循环获取指标（met）并通过sl.cache.getDropped方法判断met是否为不合法指标，如果为不合法指标就丢弃，然后根据met在sl.cache.get(entries)中查找cacheEntry。
+
+如果查找到对应的cacheEntry，就调用app.AddFast方法进行指标存储。
+
+如果没有查找到对应的 cacheEntry，就调用 app.Add 方法进行指标存储。在进行指标存储操作前，会根据在 prometheus.yml 中配置的 HonorLabels、MetricRelabelConfigs 规则，对指标的 label进行重置，然后对指标的合法性进行校验，校验方式为判断指标的label是否为空。如果校验结果不合法，就将 met添加到scrapeCache的dropped列表中，以供下一次指标存储前匹配校验，最后将指标通过sl.cache.addRef方法缓存到scrapeCache的entries列表。sl.cache.addRef方法主要用于将指标信息构造为cacheEntry结构。
+
+被存储的指标还分为自带时间戳与不带时间戳两种。自带时间戳的指标的存储按照上述流程处理。而不带时间戳的指标的存储，则将系统的当前时间作为指标的时间，并且会将指标通过sl.cache.trackStaleness方法缓存到scrapeCache的seriesCur列表中。
+
+对过期指标的处理通过调用 sl.cache.forEachStale方法完成。在 forEachStale方法中先遍历 scrapeCache 结构中的 seriesPrev，并判断 seriesPrev 中的指标是否存在于seriesCur中，如果不存在，就表示该指标为过期指标，并将过期指标的值设置为StaleNaN 后进行存储，如果存在就不做处理。在 seriesPrev 中缓存了上次存储的指标中不带时间戳的指标。
+
+
+scrape/scrape.go:1302
+
+![image](docs/images/indicator_storage_process.png)

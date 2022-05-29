@@ -737,25 +737,25 @@ type scrapeLoop struct {
 // storage references. Additionally, it tracks staleness of series between
 // scrapes.
 type scrapeCache struct {
-	iter uint64 // Current scrape iteration.
+	iter uint64 // Current scrape iteration. //  被缓存的批次数
 
 	// How many series and metadata entries there were at the last success.
 	successfulCount int
 
 	// Parsed string to an entry with information about the actual label set
 	// and its storage reference.
-	series map[string]*cacheEntry
+	series map[string]*cacheEntry // 缓存本次采集的指标(cacheEntry结构)
 
 	// Cache of dropped metric strings and their iteration. The iteration must
 	// be a pointer so we can update it without setting a new entry with an unsafe
 	// string in addDropped().
-	droppedSeries map[string]*uint64
+	droppedSeries map[string]*uint64 // 缓存不合法的指标
 
 	// seriesCur and seriesPrev store the labels of series that were seen
 	// in the current and previous scrape.
 	// We hold two maps and swap them out to save allocations.
-	seriesCur  map[uint64]labels.Labels
-	seriesPrev map[uint64]labels.Labels
+	seriesCur  map[uint64]labels.Labels // 缓存本次采集的指标
+	seriesPrev map[uint64]labels.Labels // 缓存上一批次采集的指标
 
 	metaMtx  sync.Mutex
 	metadata map[string]*metaEntry
@@ -774,6 +774,7 @@ func (m *metaEntry) size() int {
 	return len(m.help) + len(m.unit) + len(m.typ)
 }
 
+// 构建scrapeCache实例
 func newScrapeCache() *scrapeCache {
 	return &scrapeCache{
 		series:        map[string]*cacheEntry{},
@@ -784,6 +785,7 @@ func newScrapeCache() *scrapeCache {
 	}
 }
 
+// 用于scrapeCache缓存整理
 func (c *scrapeCache) iterDone(flushCache bool) {
 	c.metaMtx.Lock()
 	count := len(c.series) + len(c.droppedSeries) + len(c.metadata)
@@ -805,11 +807,13 @@ func (c *scrapeCache) iterDone(flushCache bool) {
 		// All caches may grow over time through series churn
 		// or multiple string representations of the same metric. Clean up entries
 		// that haven't appeared in the last scrape.
+		// 保留entries最近批次的指标的cacheEntry
 		for s, e := range c.series {
 			if c.iter != e.lastIter {
 				delete(c.series, s)
 			}
 		}
+		// 保留dropped最近批次的指标的不合法指标
 		for s, iter := range c.droppedSeries {
 			if c.iter != *iter {
 				delete(c.droppedSeries, s)
@@ -824,27 +828,34 @@ func (c *scrapeCache) iterDone(flushCache bool) {
 		}
 		c.metaMtx.Unlock()
 
+		// 批次号自增
 		c.iter++
 	}
 
 	// Swap current and previous series.
+	// 将当前采集的指标集与上次采集的指标集进行交换
 	c.seriesPrev, c.seriesCur = c.seriesCur, c.seriesPrev
 
 	// We have to delete every single key in the map.
+	//清空当前指标集的缓存列表
 	for k := range c.seriesCur {
 		delete(c.seriesCur, k)
 	}
 }
 
+// 根据指标信息 met获取cacheEntry结构
 func (c *scrapeCache) get(met string) (*cacheEntry, bool) {
+	// 获取cacheEntry
 	e, ok := c.series[met]
 	if !ok {
 		return nil, false
 	}
+	// 设置当前批次号
 	e.lastIter = c.iter
 	return e, true
 }
 
+// 根据指标信息增加 cacheEntry节点
 func (c *scrapeCache) addRef(met string, ref uint64, lset labels.Labels, hash uint64) {
 	if ref == 0 {
 		return
@@ -852,11 +863,13 @@ func (c *scrapeCache) addRef(met string, ref uint64, lset labels.Labels, hash ui
 	c.series[met] = &cacheEntry{ref: ref, lastIter: c.iter, lset: lset, hash: hash}
 }
 
+// 添加无效指标信息到dropped列表
 func (c *scrapeCache) addDropped(met string) {
 	iter := c.iter
 	c.droppedSeries[met] = &iter
 }
 
+// 判断met是否为无效指标
 func (c *scrapeCache) getDropped(met string) bool {
 	iterp, ok := c.droppedSeries[met]
 	if ok {
@@ -865,12 +878,16 @@ func (c *scrapeCache) getDropped(met string) bool {
 	return ok
 }
 
+// 添加不带时间戳的指标到seriesCur列表
 func (c *scrapeCache) trackStaleness(hash uint64, lset labels.Labels) {
 	c.seriesCur[hash] = lset
 }
 
+// 查找过期的指标
 func (c *scrapeCache) forEachStale(f func(labels.Labels) bool) {
+	// 遍历上一批次缓存的指标集
 	for h, lset := range c.seriesPrev {
+		// 检测h在当前批次的指标集中是否存在
 		if _, ok := c.seriesCur[h]; !ok {
 			if !f(lset) {
 				break
@@ -1284,6 +1301,7 @@ type appendErrors struct {
 
 func (sl *scrapeLoop) append(app storage.Appender, b []byte, contentType string, ts time.Time) (total, added, seriesAdded int, err error) {
 	var (
+		// 获取指标解析器
 		p              = textparse.New(b, contentType)
 		defTime        = timestamp.FromTime(ts)
 		appErrs        = appendErrors{}
@@ -1328,6 +1346,7 @@ loop:
 		total++
 
 		t := defTime
+		// 解析获取的指标
 		met, tp, v := p.Series()
 		if !sl.honorTimestamps {
 			tp = nil
@@ -1336,12 +1355,15 @@ loop:
 			t = *tp
 		}
 
+		// 判断匹配校验met的合法性，若不合法就丢弃
 		if sl.cache.getDropped(yoloString(met)) {
 			continue
 		}
+		// 根据指标从scapeCache中查找cacheEntry
 		ce, ok := sl.cache.get(yoloString(met))
-
+		// 判断cacheEntry是否获取成功
 		if ok {
+			// 指标存储
 			err = app.AddFast(ce.ref, t, v)
 			_, err = sl.checkAddError(ce, met, tp, err, &sampleLimitErr, &appErrs)
 			// In theory this should never happen.
@@ -1349,18 +1371,21 @@ loop:
 				ok = false
 			}
 		}
+		// 判断cacheEntry是否获取失败
 		if !ok {
 			var lset labels.Labels
-
+			// 转换指标格式
 			mets := p.Metric(&lset)
 			hash := lset.Hash()
 
 			// Hash label set as it is seen local to the target. Then add target labels
 			// and relabeling and store the final label set.
+			//根据prometheus.yml中配置的HonorLabels、MetricRelabelConfigs规则，对指标的label进行重置
 			lset = sl.sampleMutator(lset)
 
 			// The label set may be set to nil to indicate dropping.
 			if lset == nil {
+				// 缓存不合法的mets到dropped中
 				sl.cache.addDropped(mets)
 				continue
 			}
@@ -1371,6 +1396,7 @@ loop:
 			}
 
 			var ref uint64
+			// 指标存储
 			ref, err = app.Add(lset, t, v)
 			sampleAdded, err = sl.checkAddError(nil, met, tp, err, &sampleLimitErr, &appErrs)
 			if err != nil {
@@ -1382,8 +1408,10 @@ loop:
 
 			if tp == nil {
 				// Bypass staleness logic if there is an explicit timestamp.
+				// 将不带时间戳的指标缓存到seriesCur中
 				sl.cache.trackStaleness(hash, lset)
 			}
+			// 缓存指标
 			sl.cache.addRef(mets, ref, lset, hash)
 			if sampleAdded && sampleLimitErr == nil {
 				seriesAdded++
@@ -1414,6 +1442,7 @@ loop:
 	if err == nil {
 		sl.cache.forEachStale(func(lset labels.Labels) bool {
 			// Series no longer exposed, mark it stale.
+			// 对过期的指标进行存储标记
 			_, err = app.Add(lset, defTime, math.Float64frombits(value.StaleNaN))
 			switch errors.Cause(err) {
 			case storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp:
