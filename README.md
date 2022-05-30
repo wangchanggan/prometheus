@@ -4,7 +4,6 @@ Source Code From
 https://github.com/prometheus/prometheus/archive/refs/tags/v2.24.0.zip
 
 -   [Prometheus源码分析](#prometheus源码分析)
-    -   [目录](#目录)
     -   [源码目录结构说明](#源码目录结构说明)
     -   [Prometheus的初始化](#prometheus的初始化)
         -   [初始化服务组件](#初始化服务组件)
@@ -22,6 +21,13 @@ https://github.com/prometheus/prometheus/archive/refs/tags/v2.24.0.zip
         -   [服务发现](#服务发现)
         -   [指标采集](#指标采集)
         -   [存储指标](#存储指标)
+    -   [通知管理](#通知管理)
+        -   [启动notifier服务](#启动notifier服务)
+            -   [构建notifier结构实例](#构建notifier结构实例)
+            -   [加载服务配置](#加载服务配置)
+            -   [启动notifier](#启动notifier)
+        -   [注册notifier](#注册notifier)
+    -   [规则管理](#规则管理)
     
 ## 源码目录结构说明
 | 源码目录 | 说明 | 备注 |
@@ -238,3 +244,97 @@ scrape/scrape.go:739,777,789,847,859,867,873,882,887
 scrape/scrape.go:1302
 
 ![image](docs/images/indicator_storage_process.png)
+
+
+
+## 通知管理
+Prometheus 的通知管理指将规则触发的告警信息发送给AlertManagers 服务组的过程。通知管理服务由发现 AlertManager服务、注册notifier和nofitier服务组成。
+
+发现 AlertManagers 服务（discoveryManagerScrape）的逻辑与发现 scrape 服务（discoveryManagerNotify）的逻辑是一样的，如果与 AlertManager 组件结合，那么服务的发现类型就是static_configs（静态服务）。
+
+Prometheus在初始化过程中会完成对ruleManager和notifier组件的构造，同时notifier会通过sendAlerts方法向ruleManager回调注册。
+
+### 启动notifier服务
+#### 构建notifier结构实例
+notifier/notifier.go:110
+
+notifier 实例的构建通过调用 notifier.New 方法实现，notifier.New方法的处理逻辑如下。
+
+◎ 根据 QueueCapacity 的大小构建告警信息缓存队列，QueueCapacity 的大小由 Prometheus 命令行启动参数 --alertmanager.notification-queue-capacity指定。
+
+◎ 创建context协同控制notifier服务。
+
+◎ 向Prometheus注册notifier服务指标，包括告警缓存队列大小、告警信息长度、告警地址个数、丢弃的告警信息个数等。
+
+notifier/notifier.go:222
+
+#### 加载服务配置
+在加载系统的配置过程中，notifier 服务会从 prometheus.yml中获取 external_labels、alert_relabel_configs和告警服务配置信息，并将其保存到 AlertManagers 中。当告警触发时，会根据external_labels、alert_relabel_configs规则添加、重置对应的label，再根据告警服务信息完成告警信息的发送。
+
+同时notifier服务的配置加载也支持动态加载：
+
+notifier/notifier.go:261
+
+newAlertmanagerSet 方法会根据告警服务的配置信息构建alertmanagerSet 结构实例，但告警服务对应的ams（URL列表）还是初始的空列表：
+
+notifier/notifier.go:652
+
+#### 启动notifier
+发现的告警服务 tsets 从 discoveryManagerNotify.SyncCh 中获取，获取方式与scrape服务一样，同步更新都通过chan进行通信。
+
+notifier服务的启动方法 Run会对接收到的 notifier服务退出信号、告警服务更新信号和告警信息处理信号进行相应处理。
+
+notifier/notifier.go:315
+
+Notifier.Run方法的参数tsets为map类型， 在discoveryManagerNotify组件配置加载过程中完成构建，其中key为 prometheus.yml 文件中配置的告警服务JSON字符串的md5码，value为配置对应的告警服务。
+
+notifier 服务在接收到发现服务更新信号后会调用 reload 方法，并将最新发现的告警服务 tgs 传入 reload 方法中，更新notifier 服务中的目标服务信息（alertmanagers）。与指标采集发现服务更新的参数tgs对比，其组成结构发生了变化，在scrape中为map[job_name][targetgroup.Group] 结构，而在notifier中为map[md5.sum (AlertmanagerConfig)][targetgroup.Group] 结构，其中 AlertmanagerConfig 对应prometheus.yml中的alertmanagers配置。
+
+这里或许会有一个疑问：scrape发现服务与notifier发现服务的处理流程是一样，但发现目标服务的结构组成为什么不一样？这是因为组件在Prometheus系统中的服务层次不一样：scrape发现服务以job_name为单元，notifier发现服务以告警服务为单元，而告警服务作用于所有的job_name。
+
+reload 方法会对发现的告警服务进行有效性判读，判断依据为在加载服务配置过程中构建的 alertmanagerSet是否有与之对应的告警服务（targetgroup.Group），如果有，就调用sync方法进行告警服务信息同步，如果没有就丢弃。
+
+notifier/notifier.go:344
+
+同步告警服务信息在alertmanagerSet.sync方法中完成，在同步过程中会先遍历发现的告警服务 tgs，结合告警服务配置信息（ AlertmanagerConfig ）调用alertmanagerFromGroup 方法构建alertmanager结构实例。
+
+在 alertmanagerFromGroup 方法中将对告警信息的 label 进行整理，主要包括__address__、__alerts_path__和__scheme__，每个AlertManager 实例的内容都为告警服务的URL地址。
+
+最后遍历AlertManager实例集合all，根据每个告警服务的URL地址进行去重，然后保存结果。
+
+notifier/notifier.go:680
+
+在Notifier.Run方法中接收到发送告警信息信号后，会通过Notifier.nextBatch方法获取待发送的告警信息alerts，然后调用sendAll方法将alerts发送给告警服务。
+
+在sendAll方法中，将接收到的告警信息alerts转换为JSON字符串，然后获取告警服务信息集amSets（为防止告警服务在同一时间有更新操作，在获取过程中进行了加锁处理），最后遍历所有的告警服务，为每个告警服务都构建 goroutine，并将告警信息通过goroutine发送给对应的告警服务。
+
+notifier/notifier.go:471
+
+![image](docs/images/notifier_service_startup_process.png)
+
+
+### 注册notifier
+Prometheus在初始化过程中会将notifier服务注册到ruleManager中，在规则运算过程中触发告警后会调用注册的sendAlerts方法完成告警信息发送。
+
+cmd/prometheus/main.go:416
+
+sendAlerts方法的返回类型为NotifyFunc，在NotifyFunc中会将接收到的告警信息alerts（rules.Alert类型）转换为notifier.Alert，并将转换后的告警数据传递到Notifier.Send方法中进行处理。
+
+告警状态分为三种：StateInactive（告警活动状态）、StatePending（告警待定状态）、StateFiring（告警激活状态）。
+
+rules/manager.go:867
+
+cmd/prometheus/main.go:992
+
+告警信息alerts通过Notifier.Send方法添加到告警队列 n.queue中，但在添加之前需要对告警信息的label进行扩展和重置。
+
+将在 prometheus.yml 中配置的扩展维度（external_labels）添加到告警信息中，以及根据 alert_relabel_configs 节点下的relabel_config（维度重置规则）对告警信息中的指标维度进行重置。
+
+![image](docs/images/notifier_registration_and_callback_process.png)
+
+## 规则管理
+规则管理器会根据配置的告警规则，结合scrape采集存储的指标进行规则运算，在达到触发告警的阈值时生成告警信息，并将告警信息通知给告警服务。
+
+ruleManager 在 Prometheus 初始化时调用 rules.NewManager方法完成构建，ruleManager为Manager类型：
+
+rules\manager.go:855

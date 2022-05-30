@@ -993,6 +993,7 @@ func sendAlerts(s sender, externalURL string) rules.NotifyFunc {
 	return func(ctx context.Context, expr string, alerts ...*rules.Alert) {
 		var res []*notifier.Alert
 
+		// 数据转换，将rules.Alert类型转换为notifier.Alert类型
 		for _, alert := range alerts {
 			a := &notifier.Alert{
 				StartsAt:     alert.FiredAt,
@@ -1000,7 +1001,9 @@ func sendAlerts(s sender, externalURL string) rules.NotifyFunc {
 				Annotations:  alert.Annotations,
 				GeneratorURL: externalURL + strutil.TableLinkForExpression(expr),
 			}
+			// 判断告警是否结束
 			if !alert.ResolvedAt.IsZero() {
+				// 设置告警结束时间
 				a.EndsAt = alert.ResolvedAt
 			} else {
 				a.EndsAt = alert.ValidUntil
@@ -1009,6 +1012,7 @@ func sendAlerts(s sender, externalURL string) rules.NotifyFunc {
 		}
 
 		if len(alerts) > 0 {
+			// 发送告警
 			s.Send(res...)
 		}
 	}

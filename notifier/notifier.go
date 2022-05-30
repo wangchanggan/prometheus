@@ -108,18 +108,18 @@ func (a *Alert) ResolvedAt(ts time.Time) bool {
 // Manager is responsible for dispatching alert notifications to an
 // alert manager service.
 type Manager struct {
-	queue []*Alert
-	opts  *Options
+	queue []*Alert // 告警队列
+	opts  *Options // 配置数据
 
-	metrics *alertMetrics
+	metrics *alertMetrics // notifier服务指标
 
-	more   chan struct{}
-	mtx    sync.RWMutex
-	ctx    context.Context
-	cancel func()
+	more   chan struct{}   // 告警缓存队列存在告警的信号标记
+	mtx    sync.RWMutex    // 读写锁-同步
+	ctx    context.Context // notifier服务协同控制
+	cancel func()          // 控制结束ctx跟踪的goroutine
 
-	alertmanagers map[string]*alertmanagerSet
-	logger        log.Logger
+	alertmanagers map[string]*alertmanagerSet // 告警服务信息
+	logger        log.Logger                  // 日志记录
 }
 
 // Options are the configurable parameters of a Handler.
@@ -220,8 +220,10 @@ func do(ctx context.Context, client *http.Client, req *http.Request) (*http.Resp
 
 // NewManager is the manager constructor.
 func NewManager(o *Options, logger log.Logger) *Manager {
+	// 创建context 与 Run方法间的协同处理
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// HTTP请求客户端
 	if o.Do == nil {
 		o.Do = do
 	}
@@ -229,6 +231,7 @@ func NewManager(o *Options, logger log.Logger) *Manager {
 		logger = log.NewNopLogger()
 	}
 
+	// 创建notifier实例
 	n := &Manager{
 		queue:  make([]*Alert, 0, o.QueueCapacity),
 		ctx:    ctx,
@@ -238,11 +241,14 @@ func NewManager(o *Options, logger log.Logger) *Manager {
 		logger: logger,
 	}
 
+	//获取告警缓存队列长度
 	queueLenFunc := func() float64 { return float64(n.queueLen()) }
+	// 获取告警地址个数
 	alertmanagersDiscoveredFunc := func() float64 { return float64(len(n.Alertmanagers())) }
 
+	// 将notifier服务指标注册到Prometheus中
 	n.metrics = newAlertMetrics(
-		o.Registerer,
+		o.Registerer, // 系统指标注册器
 		o.QueueCapacity,
 		queueLenFunc,
 		alertmanagersDiscoveredFunc,
@@ -256,11 +262,15 @@ func (n *Manager) ApplyConfig(conf *config.Config) error {
 	n.mtx.Lock()
 	defer n.mtx.Unlock()
 
+	// 获取扩展label
 	n.opts.ExternalLabels = conf.GlobalConfig.ExternalLabels
+	// 获取需重置的label
 	n.opts.RelabelConfigs = conf.AlertingConfig.AlertRelabelConfigs
 
 	amSets := make(map[string]*alertmanagerSet)
 
+	// 遍历告警服务配置
+	// 将配置中的告警服务转换为alertmanagerSet结构实例
 	for k, cfg := range conf.AlertingConfig.AlertmanagerConfigs.ToMap() {
 		ams, err := newAlertmanagerSet(cfg, n.logger, n.metrics)
 		if err != nil {
@@ -306,20 +316,27 @@ func (n *Manager) Run(tsets <-chan map[string][]*targetgroup.Group) {
 
 	for {
 		select {
+		// 退出notifier服务控制
 		case <-n.ctx.Done():
 			return
+			// 发现告警服务有更新时通知处理
 		case ts := <-tsets:
 			n.reload(ts)
+			// 接收发送告警的信号
 		case <-n.more:
 		}
+		// 获取告警信息
 		alerts := n.nextBatch()
 
+		// 发送告警
 		if !n.sendAll(alerts...) {
+			// 更新服务指标
 			n.metrics.dropped.Add(float64(len(alerts)))
 		}
 		// If the queue still has items left, kick off the next iteration.
+		// 判断在告警队列中是否存在告警信息，如果存在，就发送告警信息处理信号
 		if n.queueLen() > 0 {
-			n.setMore()
+			n.setMore() // 发送告警信息处理信号
 		}
 	}
 }
@@ -328,12 +345,15 @@ func (n *Manager) reload(tgs map[string][]*targetgroup.Group) {
 	n.mtx.Lock()
 	defer n.mtx.Unlock()
 
+	// 遍历发现的告警服务，并获取对应的alertmanagerSet以判断该服务是否注册过
+	// 如果注册过，就同步对应的告警服务信息，否则丢弃
 	for id, tgroup := range tgs {
 		am, ok := n.alertmanagers[id]
 		if !ok {
 			level.Error(n.logger).Log("msg", "couldn't sync alert manager set", "err", fmt.Sprintf("invalid id:%v", id))
 			continue
 		}
+		// 同步告警服务信息
 		am.sync(tgroup)
 	}
 }
@@ -348,6 +368,7 @@ func (n *Manager) Send(alerts ...*Alert) {
 	for _, a := range alerts {
 		lb := labels.NewBuilder(a.Labels)
 
+		// 添加在prometheus.yml中配置的扩展label
 		for _, l := range n.opts.ExternalLabels {
 			if a.Labels.Get(l.Name) == "" {
 				lb.Set(l.Name, l.Value)
@@ -357,6 +378,7 @@ func (n *Manager) Send(alerts ...*Alert) {
 		a.Labels = lb.Labels()
 	}
 
+	// 重置告警label信息
 	alerts = n.relabelAlerts(alerts)
 	if len(alerts) == 0 {
 		return
@@ -364,7 +386,9 @@ func (n *Manager) Send(alerts ...*Alert) {
 
 	// Queue capacity should be significantly larger than a single alert
 	// batch could be.
+	// 告警数量是否大于告警队列容量
 	if d := len(alerts) - n.opts.QueueCapacity; d > 0 {
+		// 按照先进先出的策略，去掉多余的告警
 		alerts = alerts[d:]
 
 		level.Warn(n.logger).Log("msg", "Alert batch larger than queue capacity, dropping alerts", "num_dropped", d)
@@ -373,15 +397,19 @@ func (n *Manager) Send(alerts ...*Alert) {
 
 	// If the queue is full, remove the oldest alerts in favor
 	// of newer ones.
+	// 待发送的告警信息长度是否大于告警队列容量
 	if d := (len(n.queue) + len(alerts)) - n.opts.QueueCapacity; d > 0 {
+		// 按照先进先出的策略，去掉多余的告警
 		n.queue = n.queue[d:]
 
 		level.Warn(n.logger).Log("msg", "Alert notification queue full, dropping alerts", "num_dropped", d)
 		n.metrics.dropped.Add(float64(d))
 	}
+	// 将告警信息添加到告警队列
 	n.queue = append(n.queue, alerts...)
 
 	// Notify sending goroutine that there are alerts to be processed.
+	// 设置告警信息发送信号
 	n.setMore()
 }
 
@@ -460,6 +488,7 @@ func (n *Manager) sendAll(alerts ...*Alert) bool {
 	// for loop iterations.
 	var v1Payload, v2Payload []byte
 
+	// 获取告警服务信息集
 	n.mtx.RLock()
 	amSets := n.alertmanagers
 	n.mtx.RUnlock()
@@ -480,6 +509,7 @@ func (n *Manager) sendAll(alerts ...*Alert) bool {
 		case config.AlertmanagerAPIVersionV1:
 			{
 				if v1Payload == nil {
+					// 将告警信息转换为JSON字符串
 					v1Payload, err = json.Marshal(alerts)
 					if err != nil {
 						level.Error(n.logger).Log("msg", "Encoding alerts for Alertmanager API v1 failed", "err", err)
@@ -516,19 +546,24 @@ func (n *Manager) sendAll(alerts ...*Alert) bool {
 			}
 		}
 
+		// 遍历告警服务
 		for _, am := range ams.ams {
 			wg.Add(1)
 
+			//构建超时context，用来控制发送告警的超时时间\
 			ctx, cancel := context.WithTimeout(n.ctx, time.Duration(ams.cfg.Timeout))
 			defer cancel()
 
+			// 构建发送告警信息的goroutine
 			go func(client *http.Client, url string) {
+				// 以HTTP请求的方式发送告警信息
 				if err := n.sendOne(ctx, client, url, payload); err != nil {
 					level.Error(n.logger).Log("alertmanager", url, "count", len(alerts), "msg", "Error sending alert", "err", err)
 					n.metrics.errors.WithLabelValues(url).Inc()
 				} else {
 					numSuccess.Inc()
 				}
+				// 更新服务指标
 				n.metrics.latency.WithLabelValues(url).Observe(time.Since(begin).Seconds())
 				n.metrics.sent.WithLabelValues(url).Add(float64(len(alerts)))
 
@@ -539,6 +574,7 @@ func (n *Manager) sendAll(alerts ...*Alert) bool {
 		ams.mtx.RUnlock()
 	}
 
+	// 发送告警同步等待
 	wg.Wait()
 
 	return numSuccess.Load() > 0
@@ -622,13 +658,13 @@ func (a alertmanagerLabels) url() *url.URL {
 // alertmanagerSet contains a set of Alertmanagers discovered via a group of service
 // discovery definitions that have a common configuration on how alerts should be sent.
 type alertmanagerSet struct {
-	cfg    *config.AlertmanagerConfig
+	cfg    *config.AlertmanagerConfig // 告警服务配置
 	client *http.Client
 
-	metrics *alertMetrics
+	metrics *alertMetrics // 告警服务指标更新处理
 
-	mtx        sync.RWMutex
-	ams        []alertmanager
+	mtx        sync.RWMutex   // 告警服务变更同步锁
+	ams        []alertmanager // 告警服务URL列表
 	droppedAms []alertmanager
 	logger     log.Logger
 }
@@ -653,6 +689,8 @@ func (s *alertmanagerSet) sync(tgs []*targetgroup.Group) {
 	allAms := []alertmanager{}
 	allDroppedAms := []alertmanager{}
 
+	// 遍历发现的告警服务
+	// 根据告警服务和告警配置构建AlertManager结构实例
 	for _, tg := range tgs {
 		ams, droppedAms, err := alertmanagerFromGroup(tg, s.cfg)
 		if err != nil {
@@ -666,11 +704,13 @@ func (s *alertmanagerSet) sync(tgs []*targetgroup.Group) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	// Set new Alertmanagers and deduplicate them along their unique URL.
+	// 清空之前缓存的AlertManager
 	s.ams = []alertmanager{}
 	s.droppedAms = []alertmanager{}
 	s.droppedAms = append(s.droppedAms, allDroppedAms...)
 	seen := map[string]struct{}{}
 
+	// AlertManager信息去重处理
 	for _, am := range allAms {
 		us := am.url().String()
 		if _, ok := seen[us]; ok {
@@ -678,10 +718,13 @@ func (s *alertmanagerSet) sync(tgs []*targetgroup.Group) {
 		}
 
 		// This will initialize the Counters for the AM to 0.
+		// 更新服务指标
 		s.metrics.sent.WithLabelValues(us)
 		s.metrics.errors.WithLabelValues(us)
 
+		// 根据URL地址构建唯一键值，用于AlertManager去重
 		seen[us] = struct{}{}
+		// 保存新的AlertManager
 		s.ams = append(s.ams, am)
 	}
 }
