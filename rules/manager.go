@@ -182,6 +182,7 @@ type QueryFunc func(ctx context.Context, q string, t time.Time) (promql.Vector, 
 // EngineQueryFunc returns a new query function that executes instant queries against
 // the given engine.
 // It converts scalar into vector results.
+// 在规则管理器初始化期间，查询引擎通过 EngineQueryFunc 方法完成了在ruleManager中的注册。
 func EngineQueryFunc(engine *promql.Engine, q storage.Queryable) QueryFunc {
 	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
 		q, err := engine.NewInstantQuery(q, qs, t)
@@ -209,12 +210,15 @@ func EngineQueryFunc(engine *promql.Engine, q storage.Queryable) QueryFunc {
 // A Rule encapsulates a vector expression which is evaluated at a specified
 // interval and acted upon (currently either recorded or used for alerting).
 type Rule interface {
+	// 规则名称
 	Name() string
 	// Labels of the rule.
 	Labels() labels.Labels
 	// eval evaluates the rule, including any associated recording or alerting actions.
+	// 规则运算
 	Eval(context.Context, time.Time, QueryFunc, *url.URL) (promql.Vector, error)
 	// String returns a human-readable string representation of the rule.
+	// 以YAML格式返回规则内容
 	String() string
 	// SetLastErr sets the current error experienced by the rule.
 	SetLastError(error)
@@ -224,9 +228,11 @@ type Rule interface {
 	SetHealth(RuleHealth)
 	// Health returns the current health of the rule.
 	Health() RuleHealth
+	// 设置最近一次的规则运算耗时
 	SetEvaluationDuration(time.Duration)
 	// GetEvaluationDuration returns last evaluation duration.
 	// NOTE: Used dynamically by rules.html template.
+	// 获取最近一次的规则运算耗时
 	GetEvaluationDuration() time.Duration
 	SetEvaluationTimestamp(time.Time)
 	// GetEvaluationTimestamp returns last evaluation timestamp.
@@ -234,30 +240,31 @@ type Rule interface {
 	GetEvaluationTimestamp() time.Time
 	// HTMLSnippet returns a human-readable string representation of the rule,
 	// decorated with HTML elements for use the web frontend.
+	// 以HTML格式返回规则产生的告警信息
 	HTMLSnippet(pathPrefix string) html_template.HTML
 }
 
 // Group is a set of rules that have a logical relation.
 type Group struct {
-	name                 string
-	file                 string
-	interval             time.Duration
-	rules                []Rule
-	seriesInPreviousEval []map[string]labels.Labels // One per Rule.
+	name                 string                     // 规则组名
+	file                 string                     // 规则所属文件名
+	interval             time.Duration              // 规则计算周期
+	rules                []Rule                     // 规则列表
+	seriesInPreviousEval []map[string]labels.Labels // One per Rule. // 指标信息，与规则一一对应
 	staleSeries          []labels.Labels
-	opts                 *ManagerOptions
-	mtx                  sync.Mutex
-	evaluationTime       time.Duration
+	opts                 *ManagerOptions // 外部依赖组件
+	mtx                  sync.Mutex      // 规则组的同步锁
+	evaluationTime       time.Duration   // 规则组中规则运算的本次耗时
 	lastEvaluation       time.Time
 
 	shouldRestore bool
 
 	markStale   bool
-	done        chan struct{}
-	terminated  chan struct{}
+	done        chan struct{} // 结束信号
+	terminated  chan struct{} // 规则组的终止信号
 	managerDone chan struct{}
 
-	logger log.Logger
+	logger log.Logger // 系统日志记录
 
 	metrics *Metrics
 }
@@ -318,13 +325,13 @@ func (g *Group) Rules() []Rule { return g.rules }
 func (g *Group) Interval() time.Duration { return g.interval }
 
 func (g *Group) run(ctx context.Context) {
-	defer close(g.terminated)
+	defer close(g.terminated) // 规则管理器终止信号
 
 	// Wait an initial amount to have consistently slotted intervals.
 	evalTimestamp := g.evalTimestamp().Add(g.interval)
 	select {
-	case <-time.After(time.Until(evalTimestamp)):
-	case <-g.done:
+	case <-time.After(time.Until(evalTimestamp)): // 初始化等待
+	case <-g.done: // 停止当前Group信号
 		return
 	}
 
@@ -335,14 +342,20 @@ func (g *Group) run(ctx context.Context) {
 		},
 	})
 
+	// 定义规则组规则运算调度方法
 	iter := func() {
+		// 服务指标更新-规则组调度次数自增
 		g.metrics.iterationsScheduled.WithLabelValues(groupKey(g.file, g.name)).Inc()
 
+		// 规则运算的开始时间
 		start := time.Now()
+		// 规则运算的入口
 		g.Eval(ctx, evalTimestamp)
 		timeSinceStart := time.Since(start)
 
+		// 更新服务指标-本次调度规则运算的总耗时
 		g.metrics.iterationDuration.Observe(timeSinceStart.Seconds())
+		// 记录当前规则组规则的运算耗时
 		g.setEvaluationTime(timeSinceStart)
 		g.setLastEvaluation(start)
 	}
@@ -350,6 +363,7 @@ func (g *Group) run(ctx context.Context) {
 	// The assumption here is that since the ticker was started after having
 	// waited for `evalTimestamp` to pass, the ticks will trigger soon
 	// after each `evalTimestamp + N * g.interval` occurrence.
+	// 设置规则运算定时器
 	tick := time.NewTicker(g.interval)
 	defer tick.Stop()
 
@@ -376,6 +390,7 @@ func (g *Group) run(ctx context.Context) {
 		}(time.Now())
 	}()
 
+	// 调用规则运算的调度方法
 	iter()
 	if g.shouldRestore {
 		// If we have to restore, we wait for another Eval to finish.
@@ -383,7 +398,7 @@ func (g *Group) run(ctx context.Context) {
 		// we might not have enough data scraped, and recording rules would not
 		// have updated the latest values, on which some alerts might depend.
 		select {
-		case <-g.done:
+		case <-g.done: // 当前规则组的结束信号
 			return
 		case <-tick.C:
 			missed := (time.Since(evalTimestamp) / g.interval) - 1
@@ -392,6 +407,7 @@ func (g *Group) run(ctx context.Context) {
 				g.metrics.iterationsScheduled.WithLabelValues(groupKey(g.file, g.name)).Add(float64(missed))
 			}
 			evalTimestamp = evalTimestamp.Add((missed + 1) * g.interval)
+			// 调用规则运算的调度方法
 			iter()
 		}
 
@@ -521,24 +537,33 @@ func (g *Group) CopyState(from *Group) {
 	g.evaluationTime = from.evaluationTime
 	g.lastEvaluation = from.lastEvaluation
 
+	//缓存源规则组(from）中的规则，key为规则名称，value为规则对应的数组下标号(即索引)
+	// 这里的value是一个int类型的数组,因为在同一个规则组下允许有相同的规则名称
 	ruleMap := make(map[string][]int, len(from.rules))
 
+	// 复制源规则组中的规则信息到ruleMap中
 	for fi, fromRule := range from.rules {
 		nameAndLabels := nameAndLabels(fromRule)
 		l := ruleMap[nameAndLabels]
 		ruleMap[nameAndLabels] = append(l, fi)
 	}
 
+	// 遍历规则管理器中的规则
 	for i, rule := range g.rules {
 		nameAndLabels := nameAndLabels(rule)
+		// 判断在源规则组中是否存在当前被遍历的规则，如果不存在就跳过
 		indexes := ruleMap[nameAndLabels]
 		if len(indexes) == 0 {
 			continue
 		}
+		// 获取规则索引
 		fi := indexes[0]
+		// 将源规则组中的指标信息(Metric、Labels）赋值给目标规则组
 		g.seriesInPreviousEval[i] = from.seriesInPreviousEval[fi]
+		// 更新ruleMap的索引列表
 		ruleMap[nameAndLabels] = indexes[1:]
 
+		// 规则类型判断
 		ar, ok := rule.(*AlertingRule)
 		if !ok {
 			continue
@@ -548,6 +573,7 @@ func (g *Group) CopyState(from *Group) {
 			continue
 		}
 
+		// 将源规则组中处于活跃状态的指标赋值到目标规则组的活跃区域
 		for fp, a := range far.active {
 			ar.active[fp] = a
 		}
@@ -569,9 +595,10 @@ func (g *Group) CopyState(from *Group) {
 // Eval runs a single evaluation cycle in which all rules are evaluated sequentially.
 func (g *Group) Eval(ctx context.Context, ts time.Time) {
 	var samplesTotal float64
+	// 遍历当前规则组下的所有规则
 	for i, rule := range g.rules {
 		select {
-		case <-g.done:
+		case <-g.done: // 当前规则组的结束信号
 			return
 		default:
 		}
@@ -583,28 +610,36 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				sp.Finish()
 
 				since := time.Since(t)
+				// 更新服务指标-规则执行时间
 				g.metrics.evalDuration.Observe(since.Seconds())
+				// 记录本次规则的执行耗时
 				rule.SetEvaluationDuration(since)
 				rule.SetEvaluationTimestamp(t)
 			}(time.Now())
 
+			// 记录规则运算的次数
 			g.metrics.evalTotal.WithLabelValues(groupKey(g.File(), g.Name())).Inc()
 
+			// 规则运算
 			vector, err := rule.Eval(ctx, ts, g.opts.QueryFunc, g.opts.ExternalURL)
 			if err != nil {
 				// Canceled queries are intentional termination of queries. This normally
 				// happens on shutdown and thus we skip logging of any errors here.
+				// 在规则运算出现错误后，主动终止查询
 				if _, ok := err.(promql.ErrQueryCanceled); !ok {
 					level.Warn(g.logger).Log("msg", "Evaluating rule failed", "rule", rule, "err", err)
 				}
 				sp.SetTag("error", true)
 				sp.LogKV("error", err)
+				// 记录规则运算的失败次数
 				g.metrics.evalFailures.WithLabelValues(groupKey(g.File(), g.Name())).Inc()
 				return
 			}
 			samplesTotal += float64(len(vector))
 
+			// 判断是否为告警类型规则
 			if ar, ok := rule.(*AlertingRule); ok {
+				// 发送告警通知
 				ar.sendAlerts(ctx, ts, g.opts.ResendDelay, g.interval, g.opts.NotifyFunc)
 			}
 			var (
@@ -612,18 +647,22 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				numDuplicates = 0
 			)
 
+			// 获取指标存储器
 			app := g.opts.Appendable.Appender(ctx)
 			seriesReturned := make(map[string]labels.Labels, len(g.seriesInPreviousEval[i]))
 			defer func() {
+				// 提交指标存储
 				if err := app.Commit(); err != nil {
 					level.Warn(g.logger).Log("msg", "Rule sample appending failed", "err", err)
 					return
 				}
+				// 更新规则组下的指标
 				g.seriesInPreviousEval[i] = seriesReturned
 			}()
 			for _, s := range vector {
 				if _, err := app.Add(s.Metric, s.T, s.V); err != nil {
 					switch errors.Cause(err) {
+					// 存储指标返回的各种错误码处理
 					case storage.ErrOutOfOrderSample:
 						numOutOfOrder++
 						level.Debug(g.logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
@@ -634,6 +673,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 						level.Warn(g.logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					}
 				} else {
+					// 缓存规则运算后的结果指标
 					seriesReturned[s.Metric.String()] = s.Metric
 				}
 			}
@@ -647,8 +687,10 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			for metric, lset := range g.seriesInPreviousEval[i] {
 				if _, ok := seriesReturned[metric]; !ok {
 					// Series no longer exposed, mark it stale.
+					// 设置过期指标的指标值
 					_, err = app.Add(lset, timestamp.FromTime(ts), math.Float64frombits(value.StaleNaN))
 					switch errors.Cause(err) {
+					// 存储指标返回的各种错误码处理
 					case nil:
 					case storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp:
 						// Do not count these in logging, as this is expected if series
@@ -941,6 +983,7 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
+	// 从规则文件中加载规则
 	groups, errs := m.LoadGroups(interval, externalLabels, files...)
 	if errs != nil {
 		for _, e := range errs {
@@ -951,13 +994,17 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 	m.restored = true
 
 	var wg sync.WaitGroup
+	// 遍历规则组
 	for _, newg := range groups {
 		// If there is an old group with the same identifier,
 		// check if new group equals with the old group, if yes then skip it.
 		// If not equals, stop it and wait for it to finish the current iteration.
 		// Then copy it into the new group.
+		// 根据新的规则组信息获取规则组名
 		gn := groupKey(newg.file, newg.name)
+		// 根据规则组名获取老的规则组信息
 		oldg, ok := m.groups[gn]
+		// 删除老的规则组信息
 		delete(m.groups, gn)
 
 		if ok && oldg.Equals(newg) {
@@ -969,19 +1016,23 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 		go func(newg *Group) {
 			if ok {
 				oldg.stop()
+				// 将老规则组中的状态信息复制到新的规则组
 				newg.CopyState(oldg)
 			}
 			wg.Done()
 			// Wait with starting evaluation until the rule manager
 			// is told to run. This is necessary to avoid running
 			// queries against a bootstrapping storage.
+			// 等待释放Manager阻塞信号
 			<-m.block
+			// 启动新的规则组
 			newg.run(m.opts.Context)
 		}(newg)
 	}
 
 	// Stop remaining old groups.
 	wg.Add(len(m.groups))
+	// 停止所有老规则组服务
 	for n, oldg := range m.groups {
 		go func(n string, g *Group) {
 			g.markStale = true
@@ -1001,7 +1052,9 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 		}(n, oldg)
 	}
 
+	// 规则组同步等待处理
 	wg.Wait()
+	// 更新规则管理器中的规则组
 	m.groups = groups
 
 	return nil

@@ -28,6 +28,12 @@ https://github.com/prometheus/prometheus/archive/refs/tags/v2.24.0.zip
             -   [启动notifier](#启动notifier)
         -   [注册notifier](#注册notifier)
     -   [规则管理](#规则管理)
+        -   [规则调度](#规则调度)
+        -   [查询引擎](#查询引擎)
+            -   [源码结构（promql/）](#源码结构promql)
+            -   [BinaryExpr运算](#binaryexpr运算)
+            -   [时间窗口规则运算](#时间窗口规则运算)
+            -   [规则计算与指标查询](#规则计算与指标查询)
     
 ## 源码目录结构说明
 | 源码目录 | 说明 | 备注 |
@@ -112,7 +118,7 @@ discovery/manager.go:158
 
 cmd/prometheus/main.go:507,520
 
-rules/manager.go:940
+rules/manager.go:982
 
 cmd/prometheus/main.go:529
 
@@ -162,7 +168,7 @@ discovery/manager.go:117,311,201
 
 discovery/refresh/refresh.go:74
 
-discovery/manager.go:216,274,240,292
+discovery/manager.go:216,274,240,290
 
 
 ### 指标采集
@@ -210,7 +216,7 @@ scrape/scrape.go:457
 
 scrapeLoop是scrape的直接管理者，每个scrapeLoop都通过一个goroutine来运行，scrapeLoop控制scrape进行指标的拉取。
 
-scrape/scrape.go:1018,1088
+scrape/scrape.go:1035
 
 ◎ 在 scrapeAndReport 方法中调用 sl.scraper.scrape 进行指标采集，并将采集到的指标通过sl.append方法进行存储；
 
@@ -228,7 +234,7 @@ Prometheus在通过scrape获取指标后，调用scrapeLoop.append方法将指�
 
 ◎ 在连续两次指标存储中，第1次存储的不带时间戳指标在第2次存储的不带时间戳指标中不存在，这部分指标被称为过期指标。
 
-scrape/scrape.go:739,777,789,847,859,867,873,882,887
+scrape/scrape.go:739,778,789,847,859,867,873,882,887
 
 在 scrapeLoop.append 方法中，先获取指标存储器（app）和指解析器（p），从p中循环获取指标（met）并通过sl.cache.getDropped方法判断met是否为不合法指标，如果为不合法指标就丢弃，然后根据met在sl.cache.get(entries)中查找cacheEntry。
 
@@ -277,7 +283,7 @@ notifier/notifier.go:261
 
 newAlertmanagerSet 方法会根据告警服务的配置信息构建alertmanagerSet 结构实例，但告警服务对应的ams（URL列表）还是初始的空列表：
 
-notifier/notifier.go:652
+notifier/notifier.go:660
 
 #### 启动notifier
 发现的告警服务 tsets 从 discoveryManagerNotify.SyncCh 中获取，获取方式与scrape服务一样，同步更新都通过chan进行通信。
@@ -302,13 +308,13 @@ notifier/notifier.go:344
 
 最后遍历AlertManager实例集合all，根据每个告警服务的URL地址进行去重，然后保存结果。
 
-notifier/notifier.go:680
+notifier/notifier.go:688
 
 在Notifier.Run方法中接收到发送告警信息信号后，会通过Notifier.nextBatch方法获取待发送的告警信息alerts，然后调用sendAll方法将alerts发送给告警服务。
 
 在sendAll方法中，将接收到的告警信息alerts转换为JSON字符串，然后获取告警服务信息集amSets（为防止告警服务在同一时间有更新操作，在获取过程中进行了加锁处理），最后遍历所有的告警服务，为每个告警服务都构建 goroutine，并将告警信息通过goroutine发送给对应的告警服务。
 
-notifier/notifier.go:471
+notifier/notifier.go:479
 
 ![image](docs/images/notifier_service_startup_process.png)
 
@@ -322,13 +328,15 @@ sendAlerts方法的返回类型为NotifyFunc，在NotifyFunc中会将接收到�
 
 告警状态分为三种：StateInactive（告警活动状态）、StatePending（告警待定状态）、StateFiring（告警激活状态）。
 
-rules/manager.go:867
+rules/manager.go:909
 
 cmd/prometheus/main.go:992
 
 告警信息alerts通过Notifier.Send方法添加到告警队列 n.queue中，但在添加之前需要对告警信息的label进行扩展和重置。
 
 将在 prometheus.yml 中配置的扩展维度（external_labels）添加到告警信息中，以及根据 alert_relabel_configs 节点下的relabel_config（维度重置规则）对告警信息中的指标维度进行重置。
+
+notifier/notifier.go:363
 
 ![image](docs/images/notifier_registration_and_callback_process.png)
 
@@ -337,4 +345,113 @@ cmd/prometheus/main.go:992
 
 ruleManager 在 Prometheus 初始化时调用 rules.NewManager方法完成构建，ruleManager为Manager类型：
 
-rules\manager.go:855
+rules/manager.go:897
+
+
+### 规则调度
+Manager.loadGroups 在完成规则加载后会将结果赋值给 groups。groups为 map[string]*Group类型，其中，key为规则组组名，Group为具体的规则信息。
+
+规则组组名格式为：规则配置中的规则组名称 + “;”+ 规则所属文件名。
+
+Group结构定义如下：
+
+rules/manager.go:248
+
+遍历规则组groups，获取新的规则组信息 newg。为了能与线上运行的老规则进行热切换，在规则管理器中会先删除与新规则组信息同名的老规则组信息组oldg，然后停止oldg服务；再调用Group.copyState方法将 oldg中处于告警状态的规则复制到newg中，最后启动newg规则，在退出Manager.Update方法时停止所有老规则组服务，并更新Manager中的规则组。
+
+rules/manager.go:982
+
+规则组状态复制（Group.copyState）指从源规则组（from）中，将与目标规则组（g）相同规则名称下的指标赋值给对应的目标规则，并将源规则组处于活跃状态下的指标赋值到目标规则组的活跃区域。
+
+rules/manager.go:536
+
+规则组启动流程（Group.run）：进入Group.run方法后先进行初始化等待，以使规则运算的时间间隔 g.interval 对齐（简单理解为当前时间为 g.interval 的整数倍）；然后定义规则运算调度方法iter，调度周期由g.interval指定；在iter方法中调用g.Eval方法执行下一层次的规则运算调度。
+
+规则运算的调度周期 g.interval 由 prometheus.yml 配置文件中的 evaluation_interval配置项指定。
+
+rules/manager.go:327
+
+规则组对具体规则的调度在Group.Eval方法中实现，在Group.Eval方法中会将规则组下的每条规则（promql）依次放到查询引擎（queryEngine）中执行，如果被执行的规则是 AlertingRule类型，那么执行后的结果指标会通过notifier组件发送给告警服务，最后将结果指标存储到Prometheus的存储管理器中，并对过期指标进行存储标记处理。
+
+rules/manager.go:596
+
+![image](docs/images/rule_scheduling_process.png)
+
+
+### 查询引擎
+在Prometheus中，规则分为告警规则和记录规则两种，告警规则会产生告警信息，通过通知组件发送到告警服务，告警规则的计算表达式还可以引用记录规则。记录规则的功能与自定义的方法类似，都实现了Rule接口。
+
+rules/manager.go:212
+
+两种规则的计算都要通过实现 Rule 接口中的 Eval 方法来完成。在计算表达式相同的情况下，告警规则与记录规则在查询引擎中的执行流程是一样的，不同之处在于告警规则会根据查询引擎的计算结果和对应的规则信息输出告警信息，而告警信息的输出需要满足以下两个条件。
+
+（1）告警状态为 StatePending 时，告警持续时间必须大于等于告警规则所配置的持续时间。
+
+（2）告警状态为StateFiring。
+
+rules/manager.go:186
+
+promql/engine.go:333
+
+规则在查询引擎中运算前，先调用Engine.NewInstantQuery方法进行初始化，完成对规则的解析和对查询器（query）的构建。
+
+规则运算的调用链为：query.Exec→Engine.exec→Engine.execEvalStmt→evaluator.eval，其中规则运算的关键部分在evaluator.eval方法中实现，evaluator.eval方法会根据解析后的表达式类型进行对应的运算，支持的表达式类型为：
+
+◎ AggregateExpr
+
+◎ BinaryExpr
+
+◎ Call
+
+◎ MatrixSelector
+
+◎ NumberLiteral
+
+◎ ParenExpr
+
+◎ StringLiteral
+
+◎ UnaryExpr
+
+◎ VectorSelector
+
+![image](docs/images/regular_operation.png)
+
+#### 源码结构（promql/）
+◎ 在ast.go中定义了查询引擎中的常用结构，例如BinaryExpr、AggregateExpr、Call、MatrixSelector、NumberLiteral和VectorSelector等；
+
+◎ engine.go查询引擎的具体实现（主逻辑）；
+
+◎ 在 functions.go中实现了查询引擎的内置方法，例如avg_over_time、count_over_time和max_over_time等；
+
+◎ fuzz.go、parse.go实现了两种不同的表达式解析器，其中fuzz.go 在Prometheus中还未被应用；
+
+◎ printer.go、quantile.go、value.go查询引擎的公共基础方法。
+
+#### BinaryExpr运算
+告警规则up == 1 for: 5s，表示若up指标为1且持续时间超过5s，则将产生告警信息。
+
+![image](docs/images/BinaryExpr_operation.png)
+
+规则进入查询引擎后会先进行规则解析，将解析出的表达式 up== 1传入evaluator.eval方法中，up == 1表达式被识别为BinaryExpr类型（二元操作符类型）。表达式会被分解为左右两部分：左边的 up指标和右边的 1，这两部分又分别调用evaluator.eval 方法进行处理，up指标被识别为VectorSelector类型，1被识别为NumberLiteral 类型，最后将表达式的计算结果返回到AlertingRule.Eval方法中，在AlertingRule.Eval方法中对规则进行持续5s的判断，在查询引擎中只对表达式进行运算处理。
+
+#### 时间窗口规则运算
+
+带时间窗口的规则为 sum(sum_over_time(up[35s]))，表示对 up指标最近35s的值求和。
+
+![image](docs/images/time_window_rule_operation.png)
+
+表达式进入evaluator.eval方法后会被识别为AggregateExpr类型；脱掉外层sum后，sum_over_time(up[35s]) 表达式会被传入evaluator.eval 方法，被识别为Call类型；继续脱掉外层sum_over_time,up[35s]表达式也会被传入 evaluator.eval 方法，被识别为MatrixSelector类型，然后将计算结果一层层向上输出。
+
+sum_over_time为查询引擎中的内置方法，sum不是查询引擎的内置方法，而是内置的关键字。查询引擎内置的聚合关键字有以下11种：
+
+promql/parser/lex.go:102
+
+以上聚合都是通过evaluator.aggregation方法实现的。
+
+#### 规则计算与指标查询
+查询引擎在规则运算过程中，先对规则进行解析，然后将解析后的规则转换为对应类型的表达式（如 AggregateExpr、BinaryExpr、Call等)，最后会根据转换后的表达式和相对应的指标数据完成规则运算。
+
+根据对查询引擎的分析，在查询引擎中实现了对各种表达式的计算过程，而对指标数据的获取却没有提到。其实查询引擎是通过调用读写代理器（fanoutStorage）的Querier方法获取指标数据的，Querier方法的主要参数为指标名称、开始时间和结束时间。
+
+加入指标查询后的规则运算调用链为：query.Exec → Engine.exec → Engine.execEvalStmt → Engine.populateIterators → Engine.queryable.Querier →evaluator.eval。
